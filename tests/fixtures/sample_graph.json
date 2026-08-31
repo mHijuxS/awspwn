@@ -1,0 +1,17 @@
+{
+  "account": "111111111111",
+  "caller_arn": "arn:aws:iam::111111111111:user/dev",
+  "nodes": [
+    {"object_id": "arn:aws:iam::111111111111:user/dev", "name": "dev", "kind": "IAMUser", "account": "111111111111", "properties": {"is_caller": true, "is_admin": false}},
+    {"object_id": "arn:aws:iam::111111111111:role/lambda-exec", "name": "lambda-exec", "kind": "IAMRole", "account": "111111111111", "properties": {"is_admin": false}},
+    {"object_id": "arn:aws:iam::111111111111:role/admin-role", "name": "admin-role", "kind": "IAMRole", "account": "111111111111", "properties": {"is_admin": true, "attached_policies": ["arn:aws:iam::aws:policy/AdministratorAccess"]}},
+    {"object_id": "arn:aws:iam::111111111111:group/devs", "name": "devs", "kind": "IAMGroup", "account": "111111111111", "properties": {"is_admin": false}},
+    {"object_id": "awspwn:admin:111111111111", "name": "admin", "kind": "AWSAccount", "account": "111111111111", "properties": {"is_admin": true, "synthetic_goal": true}}
+  ],
+  "edges": [
+    {"source_id": "arn:aws:iam::111111111111:user/dev", "target_id": "arn:aws:iam::111111111111:group/devs", "kind": "MemberOf", "properties": {}},
+    {"source_id": "arn:aws:iam::111111111111:user/dev", "target_id": "arn:aws:iam::111111111111:role/lambda-exec", "kind": "CanAssume", "properties": {"via": "trust-direct"}},
+    {"source_id": "arn:aws:iam::111111111111:role/lambda-exec", "target_id": "arn:aws:iam::111111111111:role/admin-role", "kind": "CreatePolicyVersion", "properties": {}},
+    {"source_id": "arn:aws:iam::111111111111:role/admin-role", "target_id": "awspwn:admin:111111111111", "kind": "EffectiveAdmin", "properties": {"reason": "wildcard-admin"}}
+  ]
+}

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "awspwn"
+version = "0.1.0"
+description = "AWS attack-path automation - IAM/resource graph, privesc & lateral path discovery, credential-propagating exploitation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "mHijuxS" }]
+keywords = ["aws", "iam", "cloud", "pentest", "privilege-escalation", "attack-path", "lateral-movement"]
+dependencies = [
+    "boto3>=1.34",
+    "botocore>=1.34",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/mHijuxS/awspwn"
+Repository = "https://github.com/mHijuxS/awspwn"
+Issues = "https://github.com/mHijuxS/awspwn/issues"
+
+[project.optional-dependencies]
+test = ["moto>=5.0", "pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/awspwn"]
+
+[project.scripts]
+awspwn = "awspwn.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pyflakes (real bugs: unused/undefined names) + pycodestyle logic/syntax
+# classes. Deliberately not style-noise (line length etc.) on a codebase not
+# authored to ruff; this catches defects without a wall of cosmetic churn.
+select = ["E4", "E7", "E9", "F"]

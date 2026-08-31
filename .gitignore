@@ -1,0 +1,20 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Loot / engagement artifacts — never commit
+awspwn-loot/
+loot/
+secrets.jsonl
+captured-creds.jsonl
+state.json
+graph.json
+*.creds
