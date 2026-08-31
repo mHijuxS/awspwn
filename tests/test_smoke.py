@@ -115,7 +115,7 @@ def test_loot_files_are_owner_only(tmp_path):
     from awspwn.state import State, save_graph, save_state
 
     loot = tmp_path / "loot"
-    st = State(account="111111111111", caller_arn="arn:aws:iam::111111111111:user/dev")
+    st = State(origin_account="111111111111", caller_arn="arn:aws:iam::111111111111:user/dev")
     p = save_state(st, str(loot))
     g = save_graph(st, str(loot))
     assert statmod.S_IMODE(os.stat(loot).st_mode) == 0o700, "loot dir not 0700"

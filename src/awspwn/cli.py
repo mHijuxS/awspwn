@@ -11,6 +11,7 @@ Phases 1+2 (read-only) implemented:
     enum load path reachable analyze whoami info edges report loot exploit
 Phase 3 (exploitation) implemented:
     pwn      - automated path walk with credential propagation + mutation ledger
+    roam     - interactive pivot loop; re-collect from each new vantage (low-read)
     console  - trade CLI creds for a console sign-in URL (federation)
     rollback - replay the mutation ledger LIFO to undo a pwn run
 """
@@ -75,7 +76,24 @@ def _auth_parent() -> argparse.ArgumentParser:
     return p
 
 
-_MUTATING_COMMANDS = {"pwn", "console", "rollback"}
+_MUTATING_COMMANDS = {"pwn", "roam", "console", "rollback"}
+
+# Blast-radius colours for the roam menu, keyed by BlastRadius.value (kept as
+# strings so this module need not import the enum just for a colour map).
+_ROAM_BLAST = {}
+
+
+def _init_roam_blast():
+    from .models import BlastRadius
+    _ROAM_BLAST.update({
+        BlastRadius.READ: C.GREEN,
+        BlastRadius.MUTATE: C.YELLOW,
+        BlastRadius.DESTRUCTIVE: C.RED,
+        BlastRadius.EXTERNAL_EXPOSURE: C.MAGENTA,
+    })
+
+
+_init_roam_blast()
 
 
 def _banner_once(args: argparse.Namespace, subtitle: str = "") -> None:
@@ -148,7 +166,7 @@ def _graph_or_enum(args: argparse.Namespace) -> tuple[AttackGraph, dict]:
     state = _run_enum(args, phase2=not getattr(args, "iam_only", False))
     graph = AttackGraph(state.node_map(), state.edges)
     print()
-    return graph, {"account": state.account, "caller_arn": state.caller_arn}
+    return graph, {"account": state.origin_account, "caller_arn": state.caller_arn}
 
 
 def _resolve_node(graph: AttackGraph, identifier: str, label: str) -> Node:
@@ -202,48 +220,139 @@ def _build_enumerators(phase2: bool):
     return enumerators
 
 
+def _canonical_caller(client) -> str:
+    """The graph-node id for the connected identity - canonicalized so an
+    assumed-role session's caller_arn resolves to its role node for pathfinding.
+    An STS session ARN drops the role's IAM path, so for a role we recover the
+    path-qualified ARN via GetRole (matching the node the STS/self resolver mints);
+    otherwise caller_arn could point at a fabricated pathless ARN."""
+    from .aws_client import resolve_graph_principal_id
+
+    return resolve_graph_principal_id(client)
+
+
+def _reset_state_if_foreign_account(state: State, client) -> State:
+    """Top-level (`enum`/`analyze`) guard only: a loot dir built for a genuinely
+    different STARTING account is a different engagement - start fresh rather than
+    merge two unrelated accounts. This is NOT applied during `roam`/`collect_from`,
+    where a cross-account pivot is expected and the graph legitimately spans
+    accounts (nodes carry their own `account`)."""
+    acct = client.identity.account
+    if state.origin_account and state.origin_account != acct:
+        print(f"  {_color('[!]', C.YELLOW)} loot dir holds account {state.origin_account}, "
+              f"you are {acct} - starting a fresh graph")
+        state = State()
+    if not state.origin_account:
+        state.origin_account = acct
+    if not state.caller_arn:
+        state.caller_arn = _canonical_caller(client)
+    return state
+
+
+def collect_from(
+    client,
+    state: State,
+    graph: AttackGraph,
+    args: argparse.Namespace,
+    *,
+    phase2: bool = True,
+    log=None,
+) -> "object":
+    """Enumerate from THIS client's vantage and MERGE into the live graph+state.
+
+    The unit of incremental collection: idempotent, account-additive, and safe to
+    call once per identity as `roam` pivots. It never resets state (nodes are
+    account-tagged, so the graph may span accounts). Correlation is re-run over
+    the WHOLE merged graph, not just this vantage's slice, so a newly discovered
+    principal gains edges to resources found earlier AND a newly discovered
+    resource is correlated against principals found earlier. Findings/denials
+    accumulate (deduped) and are attributed to the collecting vantage."""
+    from .aws_client import canonical_principal_id
+    from .enum.base import run_all
+    from .enum.correlate import reconcile_resource_edges
+
+    log = log or (lambda m: print(m))
+    vantage = canonical_principal_id(client.identity)
+
+    regions = [args.region] if getattr(args, "region", "") else client.active_regions()
+    if phase2:
+        log(f"  {_color('[*]', C.CYAN)} sweeping {len(regions)} region(s) as {_bold(vantage)}")
+    enumerators = _build_enumerators(phase2)
+    log(f"  {_color('[*]', C.CYAN)} running {len(enumerators)} enumerator(s)…\n")
+    result = run_all(client, enumerators, regions=regions, verbose=getattr(args, "verbose", False))
+
+    n0, e0 = len(state.nodes), len(state.edges)
+    for n in result.nodes:
+        state.add_node(n)
+        graph.add_node(n)
+    for e in result.edges:
+        state.add_edge(e)
+        graph.add_edge(e)
+    # Union reconciliation over the whole merged graph: mints new-principal×old-
+    # resource and old-principal×new-resource edges, UPGRADES a legacy conditional
+    # edge once structured grants confirm it, and REMOVES a correlation edge that
+    # newer (structured) permissions now deny. Applied to both stores in lockstep.
+    upserts, removals = reconcile_resource_edges(state.nodes, state.edges)
+    for e in upserts:
+        state.add_edge(e)
+        graph.add_edge(e)
+    for src, tgt, kind in removals:
+        state.remove_edge(src, tgt, kind)
+        graph.remove_edge(src, tgt, kind)
+
+    # Opportunistic higher-fidelity refinement: if the caller holds
+    # iam:SimulatePrincipalPolicy, confirm/retract the CURRENT vantage's own
+    # candidate edges via AWS's evaluator. No-op when simulation is unavailable.
+    from .aws_client import resolve_graph_principal_id
+    from .policy.simulate import refine_edges_with_simulation
+
+    sim_arn = resolve_graph_principal_id(client)
+    pairs = [
+        (e, graph.nodes.get(e.target_id))
+        for e in graph.outgoing_edges(sim_arn)
+        if graph.nodes.get(e.target_id) is not None
+    ]
+    if pairs:
+        sim_up, sim_rm = refine_edges_with_simulation(client, sim_arn, pairs, log=lambda m: log(f"  {_dim(m)}"))
+        for e in sim_up:
+            state.add_edge(e)
+            graph.add_edge(e)
+        for src, tgt, kind in sim_rm:
+            state.remove_edge(src, tgt, kind)
+            graph.remove_edge(src, tgt, kind)
+
+    # Accumulate findings/denials rather than replacing them. Stamp the vantage on
+    # this collection's enum findings (denials with no subject arn) so per-vantage
+    # denial stays attributable and de-duplicable across recollections.
+    for f in result.findings:
+        if f.category == "enum" and not f.arn:
+            f.arn = vantage
+        state.add_finding(f)
+    state.denied = sorted(set(state.denied) | set(result.denied))
+
+    save_state(state, args.loot_dir)
+    save_graph(state, args.loot_dir)
+    log(f"  {_color('[+]', C.GREEN)} collected from {_bold(vantage)}: "
+        f"+{len(state.nodes) - n0} node(s), +{len(state.edges) - e0} edge(s)")
+    return result
+
+
 def _run_enum(args: argparse.Namespace, phase2: bool) -> State:
     from .aws_client import connect
-    from .enum.base import run_all
 
     client = connect(args)
     # Cache the connected client so a follow-on command in the same process
     # (e.g. `pwn` collecting the graph via enum) can reuse it instead of
     # re-authenticating.
     setattr(args, "_live_client", client)
+    setattr(args, "_collected", True)  # a fresh collection just ran (vs. cache load)
     print(f"  {_color('[+]', C.GREEN)} authenticated as {_bold(client.identity.arn)}")
     print(f"  {_color('[*]', C.CYAN)} account {client.identity.account}")
 
-    regions = [args.region] if getattr(args, "region", "") else client.active_regions()
-    if phase2:
-        print(f"  {_color('[*]', C.CYAN)} sweeping {len(regions)} region(s)")
-
-    enumerators = _build_enumerators(phase2)
-    print(f"  {_color('[*]', C.CYAN)} running {len(enumerators)} enumerator(s)…\n")
-    result = run_all(client, enumerators, regions=regions, verbose=getattr(args, "verbose", False))
-
-    # Cross-enumerator pass: mint principal -> resource access edges.
-    from .enum.correlate import correlate_resource_edges
-
-    result.edges.extend(correlate_resource_edges(result.nodes, result.edges))
-
     state = load_state(args.loot_dir)
-    if state.account and state.account != client.identity.account:
-        # Different account than the loot dir was built for (e.g. a relaunched
-        # lab): do NOT merge two accounts' graphs/ledgers into one.
-        print(f"  {_color('[!]', C.YELLOW)} loot dir holds account {state.account}, "
-              f"you are {client.identity.account} - starting a fresh graph")
-        state = State()
-    state.account = client.identity.account
-    state.caller_arn = client.identity.arn
-    for n in result.nodes:
-        state.add_node(n)
-    for e in result.edges:
-        state.add_edge(e)
-    state.findings = result.findings
-    state.denied = result.denied
-    save_state(state, args.loot_dir)
-    save_graph(state, args.loot_dir)
+    state = _reset_state_if_foreign_account(state, client)
+    graph = AttackGraph(state.node_map(), state.edges)
+    collect_from(client, state, graph, args, phase2=phase2)
     return state
 
 
@@ -391,7 +500,7 @@ def cmd_loot(args: argparse.Namespace) -> int:
     if captured:
         print()
         print(render_captured(captured, show_secrets=getattr(args, "show_secrets", False),
-                              current_account=state.account))
+                              current_account=state.origin_account))
     return 0
 
 
@@ -640,10 +749,10 @@ def cmd_pwn(args: argparse.Namespace) -> int:
         print(f"  {_color('[!]', C.YELLOW)} caller is {client.identity.arn}, "
               f"path starts at {source.object_id} - continuing as the caller.")
     state = load_state(args.loot_dir)
-    if not state.account:
-        state.account = account
+    if not state.origin_account:
+        state.origin_account = account
     if not state.caller_arn:
-        state.caller_arn = client.identity.arn
+        state.caller_arn = _canonical_caller(client)
 
     engine = PwnEngine(state, graph, gates, account=account, region=region,
                        loot_dir=args.loot_dir, session_name=getattr(args, "session_name", "awspwn"))
@@ -686,6 +795,213 @@ def cmd_pwn(args: argparse.Namespace) -> int:
         do_rollback(state, rb_client, args.loot_dir, log=lambda m: print(m))
 
     return 0 if report.reached_goal else 1
+
+
+def _roam_hops(graph: AttackGraph, node_id: str):
+    """Actionable one-hop options from `node_id`: abusable outgoing edges to a
+    known node, sorted identity-changing / high-value first. Structural edges
+    (MemberOf, ContainedIn) are not directly actionable and are skipped."""
+    from .abuse import get_abuse_info
+    from .strategy import ASSUME_EDGES
+
+    hops = []
+    for e in graph.outgoing_edges(node_id):
+        info = get_abuse_info(e.kind)
+        if info is None or not info.is_abusable:
+            continue
+        dst = graph.nodes.get(e.target_id)
+        if dst is None:
+            continue
+        hops.append((e, dst, info))
+
+    def _rank(item):
+        e, dst, info = item
+        identity = e.kind in ASSUME_EDGES or dst.is_principal
+        goal = bool(dst.properties.get("synthetic_goal")) or graph.is_high_value(dst)
+        return (not goal, not identity, e.kind)
+
+    hops.sort(key=_rank)
+    return hops
+
+
+def cmd_roam(args: argparse.Namespace) -> int:
+    """Interactive pivot loop: from the current identity, pick one actionable hop,
+    execute exactly that hop, and - only if it changed identity - re-collect from
+    the new vantage, then return to the menu. Reaching admin is a checkpoint, not
+    an exit; only q / EOF / interrupt ends the loop."""
+    from .aws_client import connect
+    from .models import AttackPath
+    from .strategy import Gates, PwnEngine, render_plan
+
+    _banner_once(args, "interactive pivot loop - hop principal to principal (q to quit)")
+    graph, meta = _graph_or_enum(args)
+
+    src_id = getattr(args, "source", None) or meta.get("caller_arn", "")
+    if not src_id:
+        print(f"  {_color('[!]', C.RED)} No source given and no caller in the graph. Pass a source ARN/name.")
+        return 1
+    source = _resolve_node(graph, src_id, "source")
+    account = meta.get("account", "")
+    region = getattr(args, "region", "") or "us-east-1"
+
+    gates = Gates(
+        execute=getattr(args, "execute", False),
+        allow_destructive=getattr(args, "allow_destructive", False),
+        allow_external=getattr(args, "allow_external", False),
+        allow_orphan=getattr(args, "allow_orphan", False),
+    )
+
+    state = load_state(args.loot_dir)
+    if not state.origin_account:
+        state.origin_account = account
+    phase2 = not getattr(args, "iam_only", False)
+
+    # Creds are only needed to actually walk hops. Plan mode explores the cached
+    # graph (possibly an arbitrary source) without authenticating.
+    current = getattr(args, "_live_client", None)
+    if gates.execute:
+        if current is None:
+            current = connect(args)  # validates the live caller (whoami)
+        # Refuse to execute another principal's edges with our credentials: an
+        # explicit SOURCE must match who we actually are. (Plan mode may inspect
+        # any source.)
+        caller_id = _canonical_caller(current)
+        if caller_id != source.object_id:
+            print(f"  {_color('[!]', C.RED)} refusing to execute: caller is {caller_id}, "
+                  f"but source is {source.object_id}. Roam --execute walks the caller's own edges "
+                  f"(drop --execute to inspect this source in plan mode).")
+            return 1
+        # "Collect from vantage 1": if the graph came from cache rather than a
+        # fresh collection, enumerate the current vantage before roaming so the
+        # frontier reflects the live credentials.
+        if not getattr(args, "_collected", False):
+            print(_dim("  collecting the initial vantage…"))
+            collect_from(current, state, graph, args, phase2=phase2)
+
+    # The graph principal ID is tracked SEPARATELY from the live (possibly STS
+    # session) ARN: pathfinding uses this id, creds live on `current`.
+    current_node_id = source.object_id
+    visited: set = {current_node_id}
+    reached: set = set()
+    completed: set = set()   # (src_id, kind, dst_id) of finished MUTATING hops
+    hop_count = 0
+
+    engine = PwnEngine(state, graph, gates, account=account, region=region,
+                       loot_dir=args.loot_dir, session_name=getattr(args, "session_name", "awspwn"))
+
+    while True:
+        node = graph.nodes.get(current_node_id)
+        label = node.label if node else current_node_id
+        live = f"  {_dim('creds:')} {current.identity.arn}" if current is not None else ""
+        print(f"\n  {_bold('at')} {label}  {_dim('(' + current_node_id + ')')}{live}")
+
+        all_hops = _roam_hops(graph, current_node_id)
+        # A completed MUTATING hop is not offered again (it would just re-run an
+        # already-applied escalation); it is shown as done for context.
+        hops, done = [], []
+        for e, dst, info in all_hops:
+            key = (current_node_id, e.kind, dst.object_id)
+            (done if key in completed else hops).append((e, dst, info))
+
+        if not hops:
+            print(_dim("  no onward abusable hops from here."))
+        for i, (e, dst, info) in enumerate(hops, 1):
+            tag = _color(info.blast_radius.value, _ROAM_BLAST.get(info.blast_radius, C.WHITE))
+            marks = ""
+            if dst.properties.get("synthetic_goal") or graph.is_high_value(dst):
+                marks += " " + _color("★", C.YELLOW)
+            if dst.object_id in reached:
+                marks += " " + _color("[reached]", C.GREEN)
+            if dst.object_id in visited:
+                marks += " " + _dim("[visited]")
+            print(f"    {_color(str(i), C.CYAN)}. {_color(e.kind, C.CYAN)} → {_bold(dst.label)}  [{tag}]{marks}")
+        for e, dst, _info in done:
+            print(_dim(f"    ·  {e.kind} → {dst.label}  [done]"))
+
+        recron = "recollect [r] / " if (gates.execute and current is not None) else ""
+        try:
+            sel = input(f"  hop [1-{len(hops)}] / {recron}quit [q]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if sel.lower() == "q" or not sel:
+            break
+        if sel.lower() == "r":
+            # Manual re-recon: pick up same-identity permission mutations or
+            # external policy changes without needing an identity hop.
+            if gates.execute and current is not None:
+                print(_dim("  re-collecting the current vantage…"))
+                collect_from(current, state, graph, args, phase2=phase2)
+            else:
+                print(_dim("  recollect needs --execute (and live credentials)."))
+            continue
+        try:
+            edge, dst, info = hops[int(sel) - 1]
+        except (ValueError, IndexError):
+            print(f"  {_color('[!]', C.RED)} invalid selection")
+            continue
+
+        src_node = graph.nodes.get(current_node_id) or source
+        one_hop = AttackPath(nodes=[src_node, dst], edges=[edge])
+
+        # Plan-only: preview the single hop; explicitly do NOT claim a pivot.
+        if not gates.execute:
+            print()
+            print(render_plan(one_hop, gates))
+            print(_dim("  # plan mode - nothing executed, no pivot. Re-run with --execute."))
+            continue
+
+        report = engine.walk(one_hop, current)
+        for ln in report.loot[:8]:
+            print(f"    {_color('loot:', C.MAGENTA)} {ln}")
+        for b in report.blocked:
+            print(f"    {_color('blocked:', C.YELLOW)} {b}")
+        for m in report.manual:
+            print(f"    {_color('manual:', C.YELLOW)} {m}")
+
+        if report.hops_done < 1:
+            print(_dim("  hop did not complete - staying put."))
+            continue
+        hop_count += 1
+        if info.blast_radius.value != "READ":
+            completed.add((current_node_id, edge.kind, dst.object_id))
+
+        # Checkpoint from the DESTINATION node, not WalkReport.reached_goal
+        # (which is true whenever a hop completes). Reaching admin is announced,
+        # then the loop continues.
+        if dst.properties.get("synthetic_goal") or graph.is_high_value(dst):
+            reached.add(dst.object_id)
+            print(f"  {_color('[★] REACHED', C.YELLOW)} {_bold(dst.label)}")
+
+        # New credentials != necessarily a new identity (a secret can yield
+        # replacement creds for the SAME principal). Accept valid new creds
+        # always; recollect only when the graph PRINCIPAL id actually changes.
+        if engine.final_client is not current:
+            new_client = engine.final_client
+            # The chosen edge target is authoritative when it is a principal;
+            # otherwise resolve the new identity (path-qualified) from its creds.
+            new_id = dst.object_id if dst.is_principal else _canonical_caller(new_client)
+            current = new_client
+            if new_id != current_node_id:
+                current_node_id = new_id
+                print(f"  {_color('[+]', C.GREEN)} now: {_bold(current.identity.arn)}  "
+                      f"{_dim('(graph id ' + current_node_id + ')')}")
+                if current_node_id not in visited:
+                    print(_dim("  re-collecting from the new vantage…"))
+                    collect_from(current, state, graph, args, phase2=phase2)
+                    visited.add(current_node_id)
+            else:
+                print(_dim("  replacement credentials for the same principal - not re-collecting."))
+        else:
+            print(_dim("  resource hop - identity unchanged, not re-collecting."))
+
+    print()
+    print(separator())
+    print(f"  {_bold('roam ended')}: {hop_count} hop(s), {len(visited)} identity(ies) visited, "
+          f"{len(reached)} checkpoint(s) reached")
+    if gates.execute and state.mutations:
+        print(f"  {_bold('Mutations recorded')}: {engine.mutation_count}  "
+              f"({_color('awspwn rollback', C.CYAN)} to undo)")
+    return 0
 
 
 def cmd_console(args: argparse.Namespace) -> int:
@@ -862,6 +1178,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_pwn.add_argument("-y", "--yes", dest="yes", action="store_true",
                        help="Auto-pick the cheapest path (no interactive selection)")
     p_pwn.set_defaults(func=cmd_pwn)
+
+    p_roam = sub.add_parser("roam", parents=[auth],
+                            help="Interactive pivot loop - hop identity to identity, re-collecting each vantage")
+    p_roam.add_argument("source", nargs="?", help="Start node ARN/name (default: the caller in the graph)")
+    p_roam.add_argument("--execute", action="store_true",
+                        help="Actually walk hops (default: plan only - preview each hop, no pivot)")
+    p_roam.add_argument("--allow-destructive", action="store_true", help="Permit DESTRUCTIVE hops")
+    p_roam.add_argument("--allow-external", action="store_true", help="Permit EXTERNAL_EXPOSURE hops")
+    p_roam.add_argument("--allow-orphan", action="store_true",
+                        help="Permit mutating hops whose undo cannot be recorded")
+    p_roam.add_argument("--iam-only", action="store_true",
+                        help="Re-collect IAM/STS only after a pivot (skip resource services)")
+    p_roam.add_argument("--session-name", default="awspwn", help="RoleSessionName for assume-role hops")
+    p_roam.set_defaults(func=cmd_roam)
 
     p_console = sub.add_parser("console", parents=[auth],
                                help="Convert CLI creds into a console sign-in URL")

@@ -7,7 +7,7 @@ starts from whoever you are right now.
 
 from __future__ import annotations
 
-from ..aws_client import AwsClient
+from ..aws_client import AwsClient, canonical_principal_id, resolve_role_arn
 from ..models import Node, NodeKind, Severity, Finding
 from .base import EnumResult, ServiceEnumerator
 
@@ -31,22 +31,36 @@ class StsEnumerator(ServiceEnumerator):
         account = ident.get("Account", "")
         user_id = ident.get("UserId", "")
 
-        # Persist onto the live identity so downstream context is populated.
+        # Persist the raw session ARN onto the live identity (creds propagation,
+        # logging, and simulate need to know we are a *session*).
         client.identity.arn = arn or client.identity.arn
         client.identity.account = account or client.identity.account
         client.identity.user_id = user_id or client.identity.user_id
 
-        kind = NodeKind.from_arn(arn) if arn else NodeKind.UNKNOWN
-        # Assumed-role sessions present as arn:aws:sts::acct:assumed-role/Name/session
-        if ":assumed-role/" in arn:
-            kind = NodeKind.IAM_ROLE
+        # Key the graph node by the IAM principal ARN, not the STS session ARN,
+        # so an assumed-role session lines up with the role node the IAM
+        # enumerator (or a later pivot's edge target) mints. The raw session ARN
+        # is retained as evidence.
+        graph_arn = canonical_principal_id(arn) if arn else ""
+        if graph_arn and graph_arn != arn:
+            # An STS session ARN drops the IAM role PATH (a role at /team/app/Name
+            # canonicalizes to :role/Name). GetRole resolves the real path-
+            # qualified ARN when we hold the permission; otherwise the name-only
+            # ARN is a best-effort key. Post-pivot this never matters - the chosen
+            # edge target is the authoritative role ARN.
+            graph_arn = self._resolve_role_path(client, graph_arn) or graph_arn
+
+        kind = NodeKind.from_arn(graph_arn) if graph_arn else NodeKind.UNKNOWN
+        props = {"is_caller": True, "user_id": user_id, "source": "sts"}
+        if arn and graph_arn != arn:
+            props["session_arn"] = arn  # evidence: the live STS session ARN
 
         node = Node(
-            object_id=arn or f"caller:{user_id}",
-            name=arn.rsplit("/", 1)[-1] if arn else user_id,
+            object_id=graph_arn or f"caller:{user_id}",
+            name=graph_arn.rsplit("/", 1)[-1] if graph_arn else user_id,
             kind=kind,
             account=account,
-            properties={"is_caller": True, "user_id": user_id, "source": "sts"},
+            properties=props,
         )
         result.nodes.append(node)
         result.findings.append(
@@ -59,3 +73,10 @@ class StsEnumerator(ServiceEnumerator):
             )
         )
         return result
+
+    @staticmethod
+    def _resolve_role_path(client: AwsClient, name_only_arn: str) -> str:
+        """Best-effort path-qualified role ARN. Delegates to the shared resolver so
+        the GetRole logic is not duplicated between here and the self-policy
+        resolver."""
+        return resolve_role_arn(client, name_only_arn.rsplit("/", 1)[-1])

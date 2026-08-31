@@ -278,7 +278,7 @@ def render_captured(creds: list[dict], *, show_secrets: bool = False, current_ac
 
 def render_loot(state: State) -> str:
     lines = [_bold("  Loot summary")]
-    lines.append(f"    account:  {state.account}")
+    lines.append(f"    account:  {state.origin_account}")
     lines.append(f"    caller:   {state.caller_arn}")
     lines.append(f"    nodes:    {len(state.nodes)}")
     lines.append(f"    edges:    {len(state.edges)}")

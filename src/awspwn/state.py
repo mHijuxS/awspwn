@@ -20,7 +20,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
-from .models import Edge, Finding, Mutation, Node
+from .models import (
+    GRANT_PROPERTY_KEYS,
+    Edge,
+    Finding,
+    Mutation,
+    Node,
+    NodeKind,
+    merge_grant_properties,
+)
 
 
 DEFAULT_LOOT_DIR = "./awspwn-loot"
@@ -35,7 +43,12 @@ CAPTURED_FILENAME = "captured-creds.jsonl"
 
 @dataclass
 class State:
-    account: str = ""
+    # The engagement's STARTING account. Nodes carry their own `account`, so a
+    # cross-account pivot during `roam` grows one graph spanning several accounts
+    # without ever resetting - only the top-level `enum` entry treats a genuinely
+    # different starting account as a fresh engagement. Serialized as "account"
+    # for back-compat with existing state.json / graph.json.
+    origin_account: str = ""
     caller_arn: str = ""
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
@@ -47,25 +60,65 @@ class State:
     # ─── mutators ─────────────────────────────────────────────────────────
 
     def add_node(self, node: Node) -> None:
+        # Must mirror AttackGraph.add_node exactly, or the live graph enriches a
+        # node (region, concrete kind) while the persisted state reloads the
+        # poorer copy after save/load.
         for existing in self.nodes:
             if existing.object_id == node.object_id:
-                # Merge properties; newest non-empty wins for scalars.
-                existing.properties.update(node.properties)
+                # Grant/permission keys merge by snapshot authority (below);
+                # everything else is last-writer-wins.
+                for k, v in node.properties.items():
+                    if k not in GRANT_PROPERTY_KEYS:
+                        existing.properties[k] = v
+                merge_grant_properties(existing.properties, node.properties)
                 if node.name and not existing.name:
                     existing.name = node.name
                 if node.account and not existing.account:
                     existing.account = node.account
+                if node.region and not existing.region:
+                    existing.region = node.region
+                if existing.kind == NodeKind.UNKNOWN and node.kind != NodeKind.UNKNOWN:
+                    existing.kind = node.kind
                 return
         self.nodes.append(node)
 
     def add_edge(self, edge: Edge) -> None:
+        """Insert `edge`, or ENRICH the existing one on an (src,tgt,kind) match.
+
+        A later vantage can only add confidence, never remove it: properties are
+        merged, and `conditional` may go True->False (a fresh vantage confirmed
+        the edge) but never False->True. This is what lets simulate refinement
+        and repeated `collect_from` passes upgrade an edge in place instead of
+        silently dropping the improved copy."""
         key = (edge.source_id, edge.target_id, edge.kind)
         for existing in self.edges:
             if (existing.source_id, existing.target_id, existing.kind) == key:
+                existing.properties.update(edge.properties)
+                if existing.conditional and not edge.conditional:
+                    existing.conditional = False
                 return
         self.edges.append(edge)
 
+    def remove_edge(self, source_id: str, target_id: str, kind: str) -> bool:
+        """Drop an edge (e.g. simulate returned an explicit deny). Returns True
+        if one was removed. The AttackGraph keeps its own adjacency indexes, so
+        callers that hold a live graph must remove it there too."""
+        before = len(self.edges)
+        self.edges = [
+            e for e in self.edges
+            if (e.source_id, e.target_id, e.kind) != (source_id, target_id, kind)
+        ]
+        return len(self.edges) != before
+
     def add_finding(self, finding: Finding) -> None:
+        """Append, deduplicating on (severity, category, title, arn) so repeated
+        collections from the same vantage do not pile up identical findings.
+        The arn distinguishes the same denial seen from two different vantages -
+        per-principal denial is per-principal intel, kept distinct on purpose."""
+        key = (finding.severity, finding.category, finding.title, finding.arn)
+        for existing in self.findings:
+            if (existing.severity, existing.category, existing.title, existing.arn) == key:
+                return
         self.findings.append(finding)
 
     def record_mutation(self, mutation: Mutation) -> None:
@@ -78,7 +131,7 @@ class State:
 
     def to_dict(self) -> dict:
         return {
-            "account": self.account,
+            "account": self.origin_account,
             "caller_arn": self.caller_arn,
             "nodes": [n.to_dict() for n in self.nodes],
             "edges": [e.to_dict() for e in self.edges],
@@ -91,7 +144,7 @@ class State:
     @classmethod
     def from_dict(cls, d: dict) -> "State":
         state = cls(
-            account=d.get("account", ""),
+            origin_account=d.get("account", ""),
             caller_arn=d.get("caller_arn", ""),
             denied=list(d.get("denied", [])),
             artifacts=dict(d.get("artifacts", {})),
@@ -229,7 +282,7 @@ def save_graph(state: State, loot_dir: Optional[str] = None) -> Path:
     """Write a standalone graph.json (nodes+edges only) for `awspwn load`."""
     d = secure_mkdir(loot_dir_path(loot_dir))
     doc = {
-        "account": state.account,
+        "account": state.origin_account,
         "caller_arn": state.caller_arn,
         "nodes": [n.to_dict() for n in state.nodes],
         "edges": [e.to_dict() for e in state.edges],

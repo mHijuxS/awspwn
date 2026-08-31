@@ -8,7 +8,7 @@ import json
 
 from ..aws_client import AwsClient
 from ..models import Edge, Finding, Node, NodeKind, Severity
-from .base import EnumResult, ServiceEnumerator
+from .base import EnumResult, ServiceEnumerator, minimal_role_node
 
 
 class LambdaEnumerator(ServiceEnumerator):
@@ -36,7 +36,12 @@ class LambdaEnumerator(ServiceEnumerator):
             arn = fn.get("FunctionArn", "")
             role_arn = fn.get("Role", "")
             env = fn.get("Environment", {}).get("Variables", {})
-            props = {"runtime": fn.get("Runtime", ""), "role_arn": role_arn}
+            props = {
+                "runtime": fn.get("Runtime", ""),
+                "handler": fn.get("Handler", ""),
+                "package_type": fn.get("PackageType", "Zip"),
+                "role_arn": role_arn,
+            }
             # Env vars frequently hold secrets.
             suspicious = [k for k in env if any(t in k.upper() for t in ("KEY", "SECRET", "TOKEN", "PASS"))]
             if suspicious:
@@ -45,9 +50,13 @@ class LambdaEnumerator(ServiceEnumerator):
             result.nodes.append(
                 Node(object_id=arn, name=name, kind=NodeKind.LAMBDA_FUNCTION, account=account, region=region, properties=props)
             )
-            # Function runs as its execution role -> structural edge to the role.
-            if role_arn:
-                result.edges.append(Edge(arn, role_arn, "InstanceProfileFor", {"via": "lambda-exec-role"}))
+            # Function runs as its execution role -> emit the role node (so it
+            # exists even with no IAM read) and a precise STRUCTURAL edge. This is
+            # not itself a pivot; an executable takeover edge is minted separately
+            # only when the caller can update+invoke the function.
+            if role_arn and ":role/" in role_arn:
+                result.nodes.append(minimal_role_node(role_arn))
+                result.edges.append(Edge(arn, role_arn, "LambdaExecutionRole", {}))
 
             if suspicious:
                 result.findings.append(

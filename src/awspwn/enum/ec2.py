@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from ..aws_client import AwsClient
 from ..models import Edge, Finding, Node, NodeKind, Severity
-from .base import EnumResult, ServiceEnumerator
+from .base import EnumResult, ServiceEnumerator, minimal_role_node
 
 
 class Ec2Enumerator(ServiceEnumerator):
@@ -26,7 +26,7 @@ class Ec2Enumerator(ServiceEnumerator):
             for page in paginator.paginate():
                 for reservation in page.get("Reservations", []):
                     for inst in reservation.get("Instances", []):
-                        self._instance(inst, account, region, result)
+                        self._instance(client, inst, account, region, result)
         except Exception as exc:  # noqa: BLE001
             if not self._handle(exc, "ec2:DescribeInstances", region, result):
                 raise
@@ -46,7 +46,7 @@ class Ec2Enumerator(ServiceEnumerator):
 
         return result
 
-    def _instance(self, inst: dict, account: str, region: str, result: EnumResult) -> None:
+    def _instance(self, client: AwsClient, inst: dict, account: str, region: str, result: EnumResult) -> None:
         iid = inst.get("InstanceId", "")
         arn = f"arn:aws:ec2:{region}:{account}:instance/{iid}"
         state = inst.get("State", {}).get("Name", "")
@@ -61,7 +61,9 @@ class Ec2Enumerator(ServiceEnumerator):
             Node(object_id=arn, name=iid, kind=NodeKind.EC2_INSTANCE, account=account, region=region, properties=props)
         )
 
-        # Instance profile -> role structural edge (a pivot for IMDS theft).
+        # Instance profile -> role (structural). An instance profile ARN does NOT
+        # contain its role name, so the role(s) are resolved via GetInstanceProfile;
+        # a role ARN is NEVER inferred from the profile name.
         profile = inst.get("IamInstanceProfile", {})
         prof_arn = profile.get("Arn", "")
         if prof_arn:
@@ -71,7 +73,7 @@ class Ec2Enumerator(ServiceEnumerator):
                      kind=NodeKind.INSTANCE_PROFILE, account=account, properties={})
             )
             result.edges.append(Edge(arn, prof_arn, "InstanceProfileFor", {}))
-            # IMDS creds edge: whoever runs code on the instance gets the role.
+            self._resolve_instance_profile_roles(client, prof_arn, region, result)
             result.findings.append(
                 Finding(
                     severity=Severity.INFO,
@@ -93,6 +95,23 @@ class Ec2Enumerator(ServiceEnumerator):
                     arn=arn,
                 )
             )
+
+    def _resolve_instance_profile_roles(self, client: AwsClient, prof_arn: str,
+                                        region: str, result: EnumResult) -> None:
+        """Resolve the role(s) inside an instance profile via iam:GetInstanceProfile
+        and emit them as nodes + structural edges. On denial/failure NOTHING is
+        emitted - a role is never fabricated from the profile name."""
+        name = prof_arn.rsplit("/", 1)[-1]
+        try:
+            prof = client.client("iam").get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
+        except Exception as exc:  # noqa: BLE001 - no GetInstanceProfile: no roles, no guess
+            self._handle(exc, "iam:GetInstanceProfile", region, result)
+            return
+        for role in prof.get("Roles", []):
+            role_arn = role.get("Arn", "")
+            if role_arn and ":role/" in role_arn:
+                result.nodes.append(minimal_role_node(role_arn))
+                result.edges.append(Edge(prof_arn, role_arn, "InstanceProfileRole", {}))
 
     def _snapshot(self, ec2, snap: dict, account: str, region: str, result: EnumResult) -> None:
         sid = snap.get("SnapshotId", "")

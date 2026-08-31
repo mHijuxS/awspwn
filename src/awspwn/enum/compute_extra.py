@@ -9,7 +9,7 @@ import json
 
 from ..aws_client import AwsClient
 from ..models import Edge, Finding, Node, NodeKind, Severity
-from .base import EnumResult, ServiceEnumerator
+from .base import EnumResult, ServiceEnumerator, minimal_role_node
 
 
 class ComputeExtraEnumerator(ServiceEnumerator):
@@ -48,13 +48,22 @@ class ComputeExtraEnumerator(ServiceEnumerator):
                     except Exception:  # noqa: BLE001
                         continue
                     role_arn = td.get("taskRoleArn", "")
-                    props = {"task_role": role_arn}
+                    exec_arn = td.get("executionRoleArn", "")
+                    props = {"task_role": role_arn, "execution_role": exec_arn}
                     result.nodes.append(
                         Node(object_id=tdarn, name=td.get("family", tdarn.rsplit("/", 1)[-1]),
                              kind=NodeKind.ECS_TASK_DEF, account=account, region=region, properties=props)
                     )
-                    if role_arn:
-                        result.edges.append(Edge(tdarn, role_arn, "InstanceProfileFor", {"via": "ecs-task-role"}))
+                    # The TASK role is the workload identity a running task assumes.
+                    if role_arn and ":role/" in role_arn:
+                        result.nodes.append(minimal_role_node(role_arn))
+                        result.edges.append(Edge(tdarn, role_arn, "ECSTaskRole", {}))
+                    # The EXECUTION role is used by the ECS agent (pull images, write
+                    # logs), NOT the workload identity - kept as structural metadata,
+                    # never an identity pivot.
+                    if exec_arn and ":role/" in exec_arn and exec_arn != role_arn:
+                        result.nodes.append(minimal_role_node(exec_arn))
+                        result.edges.append(Edge(tdarn, exec_arn, "ECSExecutionRole", {}))
         except Exception as exc:  # noqa: BLE001
             self._handle(exc, "ecs:ListTaskDefinitions", region, result)
 

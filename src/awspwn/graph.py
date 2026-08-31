@@ -12,13 +12,25 @@ import heapq
 from collections import defaultdict
 from typing import Optional
 
-from .models import AttackPath, BLAST_SURCHARGE, Edge, Node, NodeKind
+from .models import (
+    BLAST_SURCHARGE,
+    GRANT_PROPERTY_KEYS,
+    AttackPath,
+    Edge,
+    Node,
+    NodeKind,
+    merge_grant_properties,
+)
 
 # Purely structural - carries no exploitation value, skipped in reachability.
 LAYOUT_EDGES = {
     "AttachedTo",
     "ContainedIn",
-    "InstanceProfileFor",
+    "InstanceProfileFor",     # EC2 instance -> instance profile
+    "InstanceProfileRole",    # instance profile -> role (resolved via GetInstanceProfile)
+    "LambdaExecutionRole",    # Lambda function -> its execution role
+    "ECSTaskRole",            # ECS task definition -> its task (workload) role
+    "ECSExecutionRole",       # ECS task definition -> its execution role (agent, NOT workload)
     "TrustedBy",
 }
 
@@ -95,7 +107,13 @@ class AttackGraph:
 
     def __init__(self, nodes: dict[str, Node], edges: list[Edge]):
         self.nodes = nodes
-        self.edges = edges
+        # Own a COPY of the edge list. Callers routinely build a graph from
+        # `state.edges` (e.g. collect_from), then merge into both stores in
+        # lockstep; if the graph aliased state's list, `state.add_edge(e)` would
+        # mutate it out from under the graph's adjacency indexes and the next
+        # `graph.add_edge(e)` would double-append. Nodes come in as a fresh dict
+        # (node_map()), so only the edge list needs copying.
+        self.edges = list(edges)
         self._adjacency: dict[str, list[Edge]] = defaultdict(list)
         self._reverse_adj: dict[str, list[Edge]] = defaultdict(list)
         self._build_adjacency()
@@ -143,13 +161,55 @@ class AttackGraph:
     # ─── Mutation (live graph updates mid-pwn) ─────────────────────────────
 
     def add_node(self, node: Node) -> None:
-        self.nodes.setdefault(node.object_id, node)
+        """Insert `node`, or MERGE properties into the existing one. A later
+        vantage often knows the same node better (a role first seen as a bare ARN
+        on a resource, later enriched with its policies/action_patterns), so a
+        plain setdefault - which discards the richer copy - is wrong for
+        incremental collection. Mirrors State.add_node."""
+        existing = self.nodes.get(node.object_id)
+        if existing is None:
+            self.nodes[node.object_id] = node
+            return
+        for k, v in node.properties.items():
+            if k not in GRANT_PROPERTY_KEYS:
+                existing.properties[k] = v
+        merge_grant_properties(existing.properties, node.properties)
+        if node.name and not existing.name:
+            existing.name = node.name
+        if node.account and not existing.account:
+            existing.account = node.account
+        if node.region and not existing.region:
+            existing.region = node.region
+        if existing.kind == NodeKind.UNKNOWN and node.kind != NodeKind.UNKNOWN:
+            existing.kind = node.kind
 
     def add_edge(self, edge: Edge) -> None:
-        """Add an edge at runtime - e.g. after AddUserToGroup succeeds."""
+        """Insert an edge, or ENRICH the matching (src,tgt,kind) one in place -
+        keeping the adjacency indexes free of duplicates across recollections.
+        `conditional` may go True->False (a vantage confirmed it) but never back.
+        Used both at runtime (after AddUserToGroup succeeds) and by collect_from."""
+        for existing in self._adjacency.get(edge.source_id, []):
+            if existing.target_id == edge.target_id and existing.kind == edge.kind:
+                existing.properties.update(edge.properties)
+                if existing.conditional and not edge.conditional:
+                    existing.conditional = False
+                return
         self.edges.append(edge)
         self._adjacency[edge.source_id].append(edge)
         self._reverse_adj[edge.target_id].append(edge)
+
+    def remove_edge(self, source_id: str, target_id: str, kind: str) -> bool:
+        """Remove an edge from the list AND both adjacency indexes atomically -
+        e.g. when simulate returns an explicit deny for a candidate edge. Returns
+        True if an edge was removed."""
+        def _match(e: Edge) -> bool:
+            return (e.source_id, e.target_id, e.kind) == (source_id, target_id, kind)
+
+        before = len(self.edges)
+        self.edges = [e for e in self.edges if not _match(e)]
+        self._adjacency[source_id] = [e for e in self._adjacency.get(source_id, []) if not _match(e)]
+        self._reverse_adj[target_id] = [e for e in self._reverse_adj.get(target_id, []) if not _match(e)]
+        return len(self.edges) != before
 
     def outgoing_edges(self, node_id: str) -> list[Edge]:
         return self._adjacency.get(node_id, [])

@@ -14,7 +14,17 @@ from typing import Optional
 
 from ..aws_client import AwsClient, classify, ErrorClass
 from ..colors import C, _color
-from ..models import Edge, Finding, Node, Severity
+from ..models import Edge, Finding, Node, NodeKind, Severity
+
+
+def minimal_role_node(role_arn: str, region: str = "") -> Node:
+    """A bare IAM_ROLE node for a role referenced by a resource (a Lambda's
+    execution role, an ECS task role, an EC2 instance-profile role). Carries no
+    policy/grant properties - it exists so the role is a real graph node even with
+    no IAM read, and merges with a richer node if IAM enumeration also sees it."""
+    acct = role_arn.split(":")[4] if role_arn.count(":") >= 4 else ""
+    return Node(object_id=role_arn, name=role_arn.rsplit("/", 1)[-1],
+                kind=NodeKind.IAM_ROLE, account=acct, region=region)
 
 
 @dataclass

