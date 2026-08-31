@@ -1,0 +1,16 @@
+# gitleaks configuration.
+# Extends the default rule set and allowlists the test suite, whose moto
+# fixtures use deliberately fake AWS credentials (e.g. AKIAEMBEDDED..., AKIA
+# placeholders). Real secrets outside tests/ are still detected.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures use deliberately fake AWS credentials (moto)"
+paths = [
+  '''tests/.*''',
+]
+regexes = [
+  '''AKIA(EMBEDDED|ROTATED|EXAMPLE)[0-9A-Z]*''',
+]
