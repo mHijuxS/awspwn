@@ -182,6 +182,64 @@ PRINCIPAL_KINDS: frozenset[NodeKind] = frozenset(
 )
 
 
+# ─── Permission-snapshot merge (authority-aware) ────────────────────────────
+
+# Grant/permission properties whose merge is authority-aware, NOT last-writer-
+# wins. `grant_read_status` records how complete the snapshot is: "complete"
+# (authoritative - grant_statements + authoritative display, retraction allowed),
+# "partial" (non-authoritative evidence - the *_partial keys, additive only), or
+# absent (no self-read; legacy grant_statements are treated as complete).
+GRANT_PROPERTY_KEYS = frozenset({
+    "grant_read_status",
+    "grant_statements", "attached_policies", "action_patterns", "is_admin",
+    "grant_statements_partial", "attached_policies_partial", "action_patterns_partial",
+})
+
+_COMPLETE_KEYS = ("grant_read_status", "grant_statements", "attached_policies", "action_patterns", "is_admin")
+_PARTIAL_KEYS = ("grant_statements_partial", "attached_policies_partial", "action_patterns_partial")
+
+
+def merge_grant_properties(existing: dict, incoming: dict) -> None:
+    """Merge the permission-snapshot keys of `incoming` into `existing` in place,
+    respecting snapshot authority so a later partial read can never downgrade,
+    overwrite, or make internally inconsistent a prior complete snapshot.
+
+      * incoming complete  -> supersede: take its authoritative fields and DROP any
+        stale partial evidence.
+      * incoming partial    -> if `existing` already holds a complete snapshot
+        (authoritative grant_statements), the partial evidence is dropped (a
+        complete read fully describes the principal); otherwise store it as
+        non-authoritative evidence.
+      * incoming none        -> leave existing grant knowledge untouched.
+
+    Tradeoff (deliberate, conservative): a NEWER partial observation cannot augment
+    an OLDER complete snapshot - the partial is dropped rather than combined,
+    because we cannot tell whether the complete set is silent about a resource or
+    explicitly denies it, and combining could resurrect authoritatively-denied
+    access. Consequence: a permission CHANGE seen only by a later partial read
+    stays undiscovered until another COMPLETE read of that principal.
+    """
+    in_status = incoming.get("grant_read_status")
+    # A legacy incoming (grant_statements, no status) is a complete snapshot.
+    if in_status is None and "grant_statements" in incoming:
+        in_status = "complete"
+    if in_status == "complete":
+        for k in _COMPLETE_KEYS:
+            if k in incoming:
+                existing[k] = incoming[k]
+        for k in _PARTIAL_KEYS:
+            existing.pop(k, None)
+        return
+    if in_status == "partial":
+        if "grant_statements" in existing:
+            return  # keep the authoritative snapshot; partial adds nothing trusted
+        for k in ("grant_read_status", *_PARTIAL_KEYS):
+            if k in incoming:
+                existing[k] = incoming[k]
+        return
+    # in_status is None: incoming carries no self-read - preserve prior knowledge.
+
+
 # ─── Graph primitives (ADPwn parity) ───────────────────────────────────────
 
 

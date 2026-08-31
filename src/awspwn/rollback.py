@@ -105,6 +105,12 @@ def apply_undo(client: AwsClient, mutation: Mutation) -> None:
     kwargs = {k: v for k, v in (mutation.undo_params or {}).items()
               if not k.startswith(_RESERVED_PREFIX)}
     region = (mutation.undo_params or {}).get("_region")
+    # Durable binary restore: a Lambda-takeover undo reloads the original
+    # deployment package from the 0600 backup file recorded at takeover time.
+    backup_path = (mutation.undo_params or {}).get("_backup_path")
+    if backup_path and mutation.undo_api == "lambda:UpdateFunctionCode":
+        with open(backup_path, "rb") as f:
+            kwargs["ZipFile"] = f.read()
     api = getattr(client.client(service, region=region), method)
     api(**kwargs)
 

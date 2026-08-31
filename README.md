@@ -5,10 +5,9 @@ and lateral-movement paths, and auto-execute the chain with credential
 propagation between hops - BloodHound-style attack-path automation, applied to
 the cloud.
 
-There is no existing tool that does the whole chain for AWS: CloudFox does recon,
-enumerate-iam probes permissions, PMapper graphs IAM (unmaintained since 2022),
-Pacu runs individual exploit modules. AWSPwn stitches
-*enumerate → graph → find path → exploit* into one workflow.
+Related tools cover parts of this: CloudFox does recon, enumerate-iam probes
+permissions, PMapper graphs IAM, Pacu runs individual exploit modules. AWSPwn
+stitches *enumerate → graph → find path → exploit* into one workflow.
 
 > ⚠️ **Authorized use only.** AWSPwn automates real, billable, CloudTrail-logged
 > actions against AWS accounts, including privilege escalation and persistence.
@@ -67,6 +66,7 @@ awspwn enum --access-key AKIA... --secret-key ...  # convenient, but leaks creds
 | `awspwn report [--format json]` | Render a report from saved state |
 | `awspwn loot [--show-secrets] [--export NAME]` | Summarize state + captured creds; `--show-secrets` prints them; `--export NAME` emits eval-able lines for one cred: `eval "$(awspwn loot --export NAME)"` |
 | `awspwn pwn [src] [dst]` | Automated walk with credential propagation; plan by default, `--execute` to run, `--allow-destructive/-external/-orphan` gates, `--rollback-on-failure` |
+| `awspwn roam [src]` | Interactive pivot loop: pick one hop, execute it, re-collect from the new vantage, repeat (`q` quits). Plan by default, `--execute` to walk hops. Useful when you lack account-wide IAM read and must build the graph vantage by vantage |
 | `awspwn console` | Trade the current CLI creds for a console sign-in URL (federation) |
 | `awspwn rollback` | Replay the mutation ledger LIFO to undo a `pwn` run (`--dry-run`, `-y`) |
 
@@ -113,7 +113,7 @@ B's credentials/privileges or B's data."*
 
 ### 67 abusable edge types across five modules
 
-- **`edges/iam.py`** - the canonical Rhino privesc set: `CreateAccessKey`,
+- **`edges/iam.py`** - IAM privilege-escalation paths including `CreateAccessKey`,
   `AttachUserPolicy`, `PutUserPolicy`, `CreatePolicyVersion`,
   `UpdateAssumeRolePolicy`, `AddUserToGroup`, `CanAssume`, `PassRole`, …
 - **`edges/compute.py`** - PassRole + EC2/SSM/IMDS/Lambda/ECS/EKS/Glue/CFN/
@@ -142,11 +142,12 @@ You rarely have full IAM read on a real engagement, so `enum/iam.py` steps down:
    safe-argument API calls to map the *current identity's* effective permissions
    with zero IAM read privilege.
 
-Effective permissions are computed by a fast, offline policy matcher over the raw
-`Allow` statements (works under moto and offline). It does **not** model deny
-statements or most `Condition` keys - such edges are marked `conditional`.
-`policy/simulate.py` refines them authoritatively via
-`iam:SimulatePrincipalPolicy` when the caller holds it.
+Effective permissions are computed by an offline identity-policy evaluator. It
+models `Allow`/`Deny` precedence, `Action`/`NotAction`, resource scoping, and
+wildcards. Conditions that cannot be evaluated offline make the corresponding
+edge conditional. Resource policies, SCPs, permissions boundaries, and condition
+semantics remain outside the offline model. When available,
+`iam:SimulatePrincipalPolicy` is used as an additional AWS-side check.
 
 ---
 
@@ -177,7 +178,8 @@ mutating API (asserted by a moto test). Phase 3 (`pwn`) is gated:
   key whose secret you would otherwise lose; and `pwn` **reuses** them on a
   re-run (validating first), so a retry does not re-mint a duplicate or trip the
   2-keys-per-user cap. Inspect them with `awspwn loot` (`--show-secrets` to
-  print the values); **become one** with `eval "$(awspwn loot --export NAME)"`.
+  print the values); load one into the current shell with
+  `eval "$(awspwn loot --export NAME)"`.
   Each entry is tagged with its account and flagged if it is a session/ephemeral
   credential or belongs to a different account than the current graph (e.g. a
   previous lab), and `enum` starts a fresh graph rather than merging when the
@@ -202,8 +204,9 @@ pytest                       # offline smoke + moto-backed enum/pathfinding
   credential propagation, the mutation ledger, LIFO rollback, blast-radius gates,
   and secret-credential capture.
 
-> **Maturity note.** The read-only phases (`enum`/`analyze`/…) call only read
-> APIs and are safe to run anywhere. The exploitation engine's core path -
+> **Maturity note.** The read-only phases (`enum`/`analyze`/…) are designed to
+> issue only non-mutating API calls, with that invariant covered by tests. The
+> exploitation engine's core path -
 > `CreateAccessKey` credential propagation, `CreateLambdaWithRole` credential
 > capture, the mutation ledger, and reaching admin - has been validated
 > end-to-end against a real (CloudGoat-style) AWS account, in addition to the

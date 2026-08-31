@@ -64,7 +64,7 @@ def _admin_goal(account: str) -> Node:
 
 def _engine(tmp_path, path: AttackPath, gates: Gates, account: str) -> PwnEngine:
     graph = AttackGraph({n.object_id: n for n in path.nodes}, list(path.edges))
-    state = State(account=account, caller_arn=path.nodes[0].object_id)
+    state = State(origin_account=account, caller_arn=path.nodes[0].object_id)
     return PwnEngine(state, graph, gates, account=account, region="us-east-1",
                      loot_dir=str(tmp_path), log=lambda _m: None)
 
@@ -401,7 +401,7 @@ def test_choose_path_refuses_in_non_tty():
 def test_rollback_dry_run_needs_no_client(tmp_path):
     from awspwn.models import Mutation
 
-    st = State(account="111111111111")
+    st = State(origin_account="111111111111")
     st.mutations.append(Mutation(
         ts="t", api="iam:AttachUserPolicy", params={}, principal_used="p", blast_radius="MUTATE",
         undo_api="iam:DetachUserPolicy", undo_params={"UserName": "dev", "PolicyArn": "x"},
@@ -429,7 +429,7 @@ def test_fallback_tries_sibling_edge(tmp_path):
     ]
     path = AttackPath(nodes=nodes, edges=[edges[0]])
     graph = AttackGraph({n.object_id: n for n in nodes}, edges)
-    state = State(account=account, caller_arn=dev.object_id)
+    state = State(origin_account=account, caller_arn=dev.object_id)
     engine = PwnEngine(state, graph, Gates(execute=True, allow_destructive=True), account=account,
                        region="us-east-1", loot_dir=str(tmp_path), log=lambda _m: None)
     report = engine.walk(path, _client_as(dev.object_id, account))

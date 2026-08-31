@@ -45,6 +45,63 @@ DEFAULT_REGIONS = [
 ]
 
 
+# ─── Principal identity normalization ───────────────────────────────────────
+
+
+def canonical_principal_id(identity) -> str:
+    """Map a live STS session ARN back to the IAM principal ARN used as a graph
+    node id, so a propagated identity lines up with the node it came from.
+
+        arn:aws:sts::ACCT:assumed-role/ROLE/SESSION  -> arn:aws:iam::ACCT:role/ROLE
+
+    User ARNs, role ARNs, and anything not recognisably an STS assumed-role ARN
+    are returned unchanged. Federated-user / caller-identity STS ARNs have no IAM
+    node, so they pass through as-is. Accepts an AwsIdentity or a bare ARN str.
+
+    Note the deliberate asymmetry with the loop's frontier source: after a chosen
+    pivot the destination graph-node id is already known (it is the edge target),
+    so this normalizer is only needed where we have creds but no originating edge
+    - the initial identity, the self-node minted during collection, and simulate's
+    PolicySourceArn (which rejects STS session ARNs)."""
+    arn = getattr(identity, "arn", identity) or ""
+    parts = arn.split(":", 5)
+    # arn : partition : service : region : account : resource
+    if len(parts) < 6 or parts[2] != "sts":
+        return arn
+    resource = parts[5]
+    if not resource.startswith("assumed-role/"):
+        return arn  # federated-user / other STS forms have no IAM role node
+    rest = resource[len("assumed-role/"):]
+    role = rest.split("/", 1)[0]
+    if not role:
+        return arn
+    return f"arn:{parts[1]}:iam::{parts[4]}:role/{role}"
+
+
+def resolve_role_arn(client, role_name: str) -> str:
+    """The path-qualified role ARN via iam:GetRole (an STS session ARN and the
+    name-only canonicalization both drop the role's IAM path). Returns "" on any
+    failure - a best-effort refinement, never fatal. Shared by the STS enumerator
+    and the self-policy resolver so the GetRole logic lives in one place."""
+    try:
+        return client.client("iam").get_role(RoleName=role_name)["Role"]["Arn"]
+    except Exception:  # noqa: BLE001 - no GetRole / wrong name: keep the caller's fallback
+        return ""
+
+
+def resolve_graph_principal_id(client) -> str:
+    """The IAM principal ARN used as this identity's graph-node id: the STS
+    session ARN canonicalized to its role, then path-qualified via GetRole when
+    possible. This is the id to look the vantage up by, and the only ARN valid as
+    a SimulatePrincipalPolicy PolicySourceArn (an STS session ARN is rejected)."""
+    arn = canonical_principal_id(client.identity)
+    if ":role/" in arn:
+        resolved = resolve_role_arn(client, arn.rsplit("/", 1)[-1])
+        if resolved:
+            return resolved
+    return arn
+
+
 # ─── Error classification ───────────────────────────────────────────────────
 
 

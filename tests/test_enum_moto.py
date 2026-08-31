@@ -102,6 +102,38 @@ def test_enum_builds_graph_and_finds_path():
 
 
 @mock_aws
+def test_attach_user_policy_scoped_to_other_user_mints_no_self_admin():
+    """Regression (Step 3, gap 3): iam:AttachUserPolicy scoped to ANOTHER user
+    must NOT mint a self-escalation edge to the admin goal - the escalation acts
+    on the principal's own ARN, which the scoped grant does not cover."""
+    iam = boto3.client("iam", region_name="us-east-1")
+    account = boto3.client("sts", region_name="us-east-1").get_caller_identity()["Account"]
+    iam.create_user(UserName="dev")
+    iam.create_user(UserName="victim")
+    scoped = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "iam:AttachUserPolicy",
+            "Resource": f"arn:aws:iam::{account}:user/victim",
+        }],
+    }
+    iam.put_user_policy(UserName="dev", PolicyName="scoped", PolicyDocument=json.dumps(scoped))
+
+    result = run_all(_client(), [StsEnumerator(), IamEnumerator()], regions=["us-east-1"])
+    graph = AttackGraph({n.object_id: n for n in result.nodes}, result.edges)
+
+    dev = graph.get_node("dev")
+    goal = next(n for n in result.nodes if n.properties.get("synthetic_goal"))
+    # No AttachUserPolicy self-escalation edge to the admin goal.
+    self_admin = [
+        e for e in graph.outgoing_edges(dev.object_id)
+        if e.target_id == goal.object_id and e.kind == "AttachUserPolicy"
+    ]
+    assert not self_admin, "scoped-to-other AttachUserPolicy wrongly minted a self-admin edge"
+
+
+@mock_aws
 def test_degradation_records_denied(monkeypatch):
     _seed()
     client = _client()

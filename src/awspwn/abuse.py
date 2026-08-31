@@ -44,7 +44,11 @@ for _cat, _db in EDGE_CATEGORIES.items():
 _STRUCTURAL = [
     "AttachedTo",       # policy -> principal attachment
     "ContainedIn",      # resource -> account
-    "InstanceProfileFor",  # instance profile -> role
+    "InstanceProfileFor",   # EC2 instance -> instance profile
+    "InstanceProfileRole",  # instance profile -> role
+    "LambdaExecutionRole",  # Lambda function -> execution role
+    "ECSTaskRole",          # ECS task definition -> task (workload) role
+    "ECSExecutionRole",     # ECS task definition -> execution role (agent, not workload)
     "TrustedBy",        # role trust relationship (informational direction)
 ]
 
